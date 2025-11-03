@@ -1,1 +1,3 @@
-# colab-mcp
+# Colab-mcp
+
+An MCP server for interacting with Colab.
