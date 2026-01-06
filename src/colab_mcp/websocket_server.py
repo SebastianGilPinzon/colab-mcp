@@ -107,3 +107,4 @@ class ColabWebSocketServer:
             self._server.close()
             self.write_stream.close()
             self.read_stream.close()
+            await self._server.wait_closed()
