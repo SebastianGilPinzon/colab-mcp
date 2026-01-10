@@ -4,8 +4,11 @@ import contextlib
 from contextlib import AsyncExitStack
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
+from fastmcp.server.dependencies import get_context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
 from fastmcp.server.proxy import FastMCPProxy
+from fastmcp.tools.tool import Tool
 from mcp.client.session import ClientSession
 
 from colab_mcp.websocket_server import ColabWebSocketServer
@@ -13,12 +16,22 @@ from colab_mcp.websocket_server import ColabWebSocketServer
 class ColabProxyMiddleware(Middleware):
     def __init__(self, wss: ColabWebSocketServer):
         self.wss = wss
+        self.last_message_connected = self.wss.connection_live.is_set()
 
     async def on_message(self, context: MiddlewareContext, call_next):
-        if self.wss.connection_live.is_set():
-            return await call_next(context)
-        else:
-            raise Exception('No Colab browser session is connected. The user needs to connect their Colab session.')
+        """ 
+        Check for a change to Colab session connectivity on any communication with this MCP server and 
+        notify the client when the connectivity status has changed. 
+        """
+        connected = self.wss.connection_live.is_set()
+        connection_state_changed = connected != self.last_message_connected
+        context.fastmcp_context.set_state("fe_connected", connected)
+        self.last_message_connected = connected
+        if connection_state_changed:
+           await context.fastmcp_context.send_prompt_list_changed()
+           await context.fastmcp_context.send_resource_list_changed()
+           await context.fastmcp_context.send_tool_list_changed()
+        return await call_next(context)
 
 class ColabTransport(ClientTransport):
     def __init__(self, wss: ColabWebSocketServer):
@@ -63,18 +76,31 @@ class ColabProxyClient():
             self._start_task.cancel()
         await self._exit_stack.aclose()
 
+async def check_session_proxy_tool_fn() -> bool:
+        ctx = get_context()
+        return ctx.get_state("fe_connected")
+
+check_session_proxy_tool = Tool.from_function(
+            fn=check_session_proxy_tool_fn,
+            name="check_colab_actions",
+            description="Check if there are available actions for the user's active Google Colab session."
+        )
 
 class ColabSessionProxy():
     def __init__(self):
         self._exit_stack = AsyncExitStack()
         self.proxy_server: FastMCPProxy | None = None
+        # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
+        self.middleware: list[Middleware] = []
 
     async def start_proxy_server(self):
         wss = await self._exit_stack.enter_async_context(ColabWebSocketServer())
         proxy_client = await self._exit_stack.enter_async_context(ColabProxyClient(wss))
         self.proxy_server = FastMCPProxy(client_factory=proxy_client.client_factory, 
                         instructions="Connects to a user's active Google Colab session and allows for interactions with their Google Colab notebook")
-        self.proxy_server.add_middleware(ColabProxyMiddleware(wss))
+        # ColabProxyMiddleware must be first because it sets the fe_connected state
+        self.middleware.append(ColabProxyMiddleware(wss))
+        self.middleware.append(ToolInjectionMiddleware(tools=[check_session_proxy_tool]))
 
     async def cleanup(self):
         await self._exit_stack.aclose()
