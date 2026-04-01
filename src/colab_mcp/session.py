@@ -45,36 +45,15 @@ NOT_CONNECTED_MSG = (
 
 
 def _make_stub_server() -> FastMCP:
-    """Create a FastMCP server with stub notebook tools.
+    """Create an empty FastMCP server used as fallback when no browser is connected.
 
-    These stubs are returned by client_factory() when no browser is connected.
-    They ensure MCP clients that snapshot tools at startup (and ignore
-    notifications/tools/list_changed) can still discover the notebook tools.
-    Once the browser connects, the real proxy tools take over transparently.
+    The actual stub tools are provided by ToolInjectionMiddleware via
+    _make_injected_tools(). This server must remain empty to avoid
+    duplicate tool names (the proxy's ProxyToolManager merges tools from
+    this server with those from the middleware, so any tools defined here
+    would appear twice in tools/list).
     """
-    stub = FastMCP("colab-notebook-stubs")
-
-    @stub.tool()
-    async def add_code_cell(code: str = "", cellIndex: int = -1) -> str:
-        """Add a new code cell to the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
-        return NOT_CONNECTED_MSG
-
-    @stub.tool()
-    async def add_text_cell(content: str = "", cellIndex: int = -1) -> str:
-        """Add a new text/markdown cell to the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
-        return NOT_CONNECTED_MSG
-
-    @stub.tool()
-    async def execute_cell(cellIndex: int = 0) -> str:
-        """Execute a cell in the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
-        return NOT_CONNECTED_MSG
-
-    @stub.tool()
-    async def update_cell(cellId: str = "", content: str = "") -> str:
-        """Update the contents of an existing cell in the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
-        return NOT_CONNECTED_MSG
-
-    return stub
+    return FastMCP("colab-notebook-stubs")
 
 
 class ColabTransport(ClientTransport):
@@ -290,24 +269,13 @@ def _make_injected_tools(
 class ColabSessionProxy:
     def __init__(self):
         self._exit_stack = AsyncExitStack()
-        self.proxy_server: FastMCPProxy | None = None
-        # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
-        self.middleware: list[Middleware] = []
+        self.proxy_client: ColabProxyClient | None = None
         self.wss: ColabWebSocketServer | None = None
 
     async def start_proxy_server(self):
         self.wss = await self._exit_stack.enter_async_context(ColabWebSocketServer())
-        proxy_client = await self._exit_stack.enter_async_context(
+        self.proxy_client = await self._exit_stack.enter_async_context(
             ColabProxyClient(self.wss)
-        )
-        self.proxy_server = FastMCPProxy(
-            client_factory=proxy_client.client_factory,
-            instructions="Connects to a user's Google Colab session in a browser and allows for interactions with their Google Colab notebook",
-        )
-        injected_tools = _make_injected_tools(proxy_client)
-        self.middleware.append(ColabProxyMiddleware(proxy_client))
-        self.middleware.append(
-            ToolInjectionMiddleware(tools=injected_tools)
         )
 
     async def cleanup(self):

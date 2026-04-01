@@ -58,16 +58,17 @@ def mock_proxy_client(mock_wss):
     return client
 
 
-class TestStubServer:
-    """Tests for the pre-registered stub tools."""
+class TestDirectTools:
+    """Tests for the direct tool registration on the mcp server."""
 
     @pytest.mark.asyncio
-    async def test_stub_server_has_expected_tools(self):
-        stub = session._make_stub_server()
-        async with Client(stub) as client:
+    async def test_mcp_has_expected_tools(self):
+        from colab_mcp import mcp
+        async with Client(mcp) as client:
             tools = await client.list_tools()
             tool_names = {t.name for t in tools}
             assert tool_names == {
+                "open_colab_browser_connection",
                 "add_code_cell",
                 "add_text_cell",
                 "execute_cell",
@@ -75,19 +76,13 @@ class TestStubServer:
             }
 
     @pytest.mark.asyncio
-    async def test_stub_tools_return_not_connected_message(self):
-        stub = session._make_stub_server()
-        async with Client(stub) as client:
+    async def test_stub_returns_not_connected_when_no_proxy(self):
+        from colab_mcp import mcp
+        async with Client(mcp) as client:
             result = await client.call_tool("add_code_cell", {"code": "print('hi')"})
             assert any(
                 session.NOT_CONNECTED_MSG in c.text for c in result.content
             )
-
-    @pytest.mark.asyncio
-    async def test_stub_client_lists_tools_when_disconnected(self, mock_wss):
-        client = session.ColabProxyClient(mock_wss)
-        stub_client = client.client_factory()
-        assert stub_client is client.stubbed_mcp_client
 
 
 class TestAwaitToolsReady:
@@ -330,28 +325,19 @@ class TestColabTransport:
 
 class TestColabSessionProxy:
     @pytest.mark.asyncio
-    @patch("colab_mcp.session.ToolInjectionMiddleware")
     @patch("colab_mcp.session.ColabWebSocketServer")
     @patch("colab_mcp.session.ColabProxyClient")
-    @patch("colab_mcp.session.ColabProxyMiddleware")
-    @patch("colab_mcp.session._make_injected_tools")
     async def test_start_proxy_server(
         self,
-        mock_make_tools,
-        mock_colab_proxy_middleware,
         mock_colab_proxy_client,
         mock_colab_web_socket_server,
-        mock_tool_injection_middleware,
     ):
         mock_colab_web_socket_server.return_value.__aenter__ = AsyncMock()
         mock_colab_proxy_client.return_value.__aenter__ = AsyncMock()
         proxy = session.ColabSessionProxy()
         await proxy.start_proxy_server()
         mock_colab_proxy_client.assert_called_once()
-        assert proxy.proxy_server is not None
-        mock_colab_proxy_middleware.assert_called_once()
-        mock_tool_injection_middleware.assert_called_once()
-        mock_make_tools.assert_called_once()
+        assert proxy.proxy_client is not None
 
     @pytest.mark.asyncio
     async def test_cleanup(self):
