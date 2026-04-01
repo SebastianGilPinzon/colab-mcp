@@ -185,10 +185,10 @@ async def main_async():
     if args.client_oauth_config:
         try:
             from colab_mcp.auth import get_credentials
-            from colab_mcp.client import ColabClient
+            from colab_mcp.client import ColabClient, Prod
             logging.info("initializing Colab API client with OAuth")
             session = get_credentials(args.client_oauth_config)
-            _colab_client = ColabClient(session)
+            _colab_client = ColabClient(Prod(), session)
             logging.info("Colab API client ready")
         except Exception as e:
             logging.warning(f"Failed to initialize Colab API client: {e}")

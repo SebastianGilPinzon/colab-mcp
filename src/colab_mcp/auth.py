@@ -19,7 +19,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google.auth.transport import requests
 
-OAUTH_SERVER_PORT = 53919
+OAUTH_SERVER_PORT = 8085
 
 SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
