@@ -32,6 +32,7 @@ mcp = FastMCP(name="ColabMCP")
 # These will be set during main_async() startup
 _proxy_client = None
 _session_mcp = None
+_colab_client = None  # For runtime API (assign/unassign GPU)
 
 
 async def _forward_or_stub(tool_name: str, arguments: dict) -> str:
@@ -101,6 +102,34 @@ async def update_cell(cellId: str = "", content: str = "") -> str:
     return await _forward_or_stub("update_cell", {"cellId": cellId, "content": content})
 
 
+@mcp.tool()
+async def change_runtime(accelerator: str = "T4") -> str:
+    """Change the Colab runtime to use a specific GPU accelerator. Valid values: NONE, T4, L4, A100. Requires OAuth setup (first time opens browser for consent)."""
+    if _colab_client is None:
+        return "Runtime API not initialized. Start with --client-oauth-config flag pointing to your OAuth client secrets JSON."
+    try:
+        from colab_mcp.client import Accelerator, Variant
+        import uuid
+
+        acc = Accelerator(accelerator)
+        variant = Variant.GPU if acc != Accelerator.NONE else Variant.DEFAULT
+        notebook_hash = str(uuid.uuid4())
+
+        # Unassign current VM if any
+        try:
+            assignments = _colab_client.list_assignments()
+            for a in assignments:
+                _colab_client.unassign(a.endpoint)
+        except Exception:
+            pass
+
+        # Assign new VM
+        result = _colab_client.assign(notebook_hash, variant, acc)
+        return f"Runtime changed to {accelerator}. Endpoint: {result.endpoint}. Use open_colab_browser_connection to connect to the new runtime."
+    except Exception as e:
+        return f"Failed to change runtime: {e}"
+
+
 def init_logger(logdir):
     log_filename = datetime.datetime.now().strftime(
         f"{logdir}/colab-mcp.%Y-%m-%d_%H-%M-%S.log"
@@ -133,11 +162,17 @@ def parse_args(v):
         action="store_true",
         default=True,
     )
+    parser.add_argument(
+        "--client-oauth-config",
+        help="Path to OAuth client secrets JSON for Colab API access (enables change_runtime tool).",
+        action="store",
+        default=None,
+    )
     return parser.parse_args(v)
 
 
 async def main_async():
-    global _proxy_client, _session_mcp
+    global _proxy_client, _session_mcp, _colab_client
     args = parse_args(sys.argv[1:])
     init_logger(args.log)
 
@@ -146,6 +181,17 @@ async def main_async():
         _session_mcp = ColabSessionProxy()
         await _session_mcp.start_proxy_server()
         _proxy_client = _session_mcp.proxy_client
+
+    if args.client_oauth_config:
+        try:
+            from colab_mcp.auth import get_credentials
+            from colab_mcp.client import ColabClient
+            logging.info("initializing Colab API client with OAuth")
+            session = get_credentials(args.client_oauth_config)
+            _colab_client = ColabClient(session)
+            logging.info("Colab API client ready")
+        except Exception as e:
+            logging.warning(f"Failed to initialize Colab API client: {e}")
 
     try:
         await mcp.run_async()
