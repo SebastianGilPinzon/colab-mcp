@@ -1,6 +1,6 @@
 # Colab MCP (Enhanced Fork)
 
-An MCP server for controlling Google Colab from any AI coding agent. This fork fixes critical bugs in the [official repo](https://github.com/googlecolab/colab-mcp) and adds features that were removed upstream.
+An MCP server for controlling Google Colab from any AI coding agent. This fork fixes critical bugs in the [official repo](https://github.com/googlecolab/colab-mcp) and adds features that were removed upstream — including **stale-server detection / cleanup** that eliminates the "Disconnected from the local Colab MCP server" message when you have multiple Claude Code sessions or Colab tabs open ([upstream #84](https://github.com/googlecolab/colab-mcp/discussions/84)).
 
 ## Why This Fork?
 
@@ -21,6 +21,7 @@ This fork fixes both. All 6 tools appear immediately, and you can assign T4/L4/A
 | OAuth token caching | N/A | Yes (authorize once, cached forever) |
 | Windows compatibility | Port 53919 blocked | Fixed (port 8085) |
 | ColabClient initialization | N/A | Fixed (Prod() env argument) |
+| Stale-server detection / cleanup | None — silent "Disconnected" | `--list-running` + `--kill-stale`, registry pruning on startup |
 
 ## Available Tools
 
@@ -175,6 +176,26 @@ Add your Google email as a test user in Cloud Console > OAuth consent screen > T
 ### Browser opens but connection times out
 Make sure you have a Colab notebook open in the browser tab that opened. Click "Connect" if prompted.
 
+### "Disconnected from the local Colab MCP server" (orphaned servers)
+
+If a Colab tab in your browser shows **"Disconnected from the local Colab MCP server"** and re-clicking *Connect* doesn't help, the cause is almost always one or more **orphaned colab-mcp processes** from previous Claude Code sessions. Each instance picks a random ephemeral port, but your Colab tab only remembers the port from the URL fragment used when it first opened — when that server dies (or you spawn a new Claude Code session with a new server on a different port), the tab keeps trying to reach a dead address.
+
+This fork ships with built-in diagnostics. Run any of these from a **regular shell** (not from inside Claude Code, which is itself running an MCP instance):
+
+```bash
+# Show every colab-mcp server currently registered as running
+uv run --directory /path/to/colab-mcp colab-mcp --list-running
+
+# Terminate orphaned colab-mcp servers, then exit
+uv run --directory /path/to/colab-mcp colab-mcp --kill-stale
+```
+
+The server writes a small registry file at `%LOCALAPPDATA%\colab-mcp\registry.json` (Windows) or `~/.colab-mcp/registry.json` (macOS/Linux) listing pid + port for each running instance. On every startup it prunes dead entries automatically, and on clean shutdown it removes its own. If `open_colab_browser_connection` times out from inside Claude Code, the new error message also includes the ports + pids of any peer servers so you can identify which one your browser tab is actually pointed at.
+
+After cleaning up, re-run `open_colab_browser_connection` — it will open a fresh Colab tab pointed at the current (only) server's port + token.
+
+Fixes [upstream issue #84](https://github.com/googlecolab/colab-mcp/discussions/84).
+
 ---
 
 ## Compatibility
@@ -198,6 +219,7 @@ This fork is based on [`googlecolab/colab-mcp`](https://github.com/googlecolab/c
 - **`cae498b`** Add `change_runtime` tool with OAuth for programmatic GPU assignment
 - **`440e3bc`** Fix `ColabClient` initialization (missing `Prod()` env arg) + change OAuth port to 8085 for Windows
 - **`e66ee69`** Match real Colab API signatures (language param, cellId, run_code_cell)
+- **stale-server detection** Process registry + `--list-running` / `--kill-stale` flags + clearer timeout diagnostics — fixes [upstream #84](https://github.com/googlecolab/colab-mcp/discussions/84) "Disconnected from the local Colab MCP server"
 
 Google [does not accept external contributions](https://github.com/googlecolab/colab-mcp/blob/main/CONTRIBUTING.md) to the official repo, so these fixes live here.
 

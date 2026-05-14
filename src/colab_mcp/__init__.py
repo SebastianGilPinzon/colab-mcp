@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import datetime
 import logging
+import os
 import tempfile
 import sys
 import webbrowser
@@ -25,6 +26,7 @@ from fastmcp.utilities import logging as fastmcp_logger
 
 from colab_mcp.session import ColabSessionProxy, NOT_CONNECTED_MSG
 from colab_mcp.websocket_server import COLAB, SCRATCH_PATH
+from colab_mcp import process_registry
 
 
 mcp = FastMCP(name="ColabMCP")
@@ -69,8 +71,34 @@ async def open_colab_browser_connection() -> str:
         tool_names = await _proxy_client.await_tools_ready()
         tools_text = ", ".join(tool_names) if tool_names else "none discovered"
         return f"Connection successful. Available notebook tools: {tools_text}. You can now create, edit, and execute cells in the Colab notebook."
-    else:
-        return "Connection timed out. Please make sure you have a Colab notebook open in your browser and try again."
+
+    # Timed out — surface diagnostic info about other running servers so the
+    # user can recognize the "old browser tab pointed at a dead port" case.
+    try:
+        others = [
+            e for e in process_registry.list_running()
+            if e.pid != os.getpid()
+        ]
+    except Exception:
+        others = []
+    my_port = _proxy_client.wss.port
+    if others:
+        peer_ports = ", ".join(f"{e.port} (pid {e.pid})" for e in others)
+        return (
+            f"Connection timed out. This server is on port {my_port}, but "
+            f"{len(others)} other colab-mcp server(s) are also running: "
+            f"{peer_ports}. If you have an old Colab tab open, it may be "
+            "pointing at one of those instead of this server. Either close "
+            "the old tab and let me open a fresh one, or run `colab-mcp "
+            "--kill-stale` to clean up orphaned servers."
+        )
+    return (
+        f"Connection timed out. This server is on port {my_port}. Please "
+        "make sure you have a Colab notebook open in your browser and try "
+        "again. If a Colab tab opened but says 'Disconnected from the local "
+        "Colab MCP server', refresh that tab — the URL fragment contains the "
+        "correct token+port for this server instance."
+    )
 
 
 @mcp.tool()
@@ -168,7 +196,31 @@ def parse_args(v):
         action="store",
         default=None,
     )
+    parser.add_argument(
+        "--list-running",
+        help="List all currently-running colab-mcp servers and exit.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--kill-stale",
+        help="Terminate all running colab-mcp servers (including this one is NOT included) and exit. Useful when the browser shows 'Disconnected from the local Colab MCP server' due to orphaned processes from prior sessions.",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args(v)
+
+
+def _print_running_servers() -> None:
+    entries = process_registry.list_running()
+    if not entries:
+        print("No colab-mcp servers currently registered as running.")
+        return
+    print(f"Found {len(entries)} running colab-mcp server(s):")
+    import datetime as _dt
+    for e in entries:
+        started = _dt.datetime.fromtimestamp(e.started_at).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  pid={e.pid:<6}  port={e.port:<6}  host={e.host}  started={started}")
 
 
 async def main_async():
@@ -176,11 +228,45 @@ async def main_async():
     args = parse_args(sys.argv[1:])
     init_logger(args.log)
 
+    # Diagnostic / cleanup flags exit early.
+    if args.list_running:
+        _print_running_servers()
+        return
+    if args.kill_stale:
+        removed = process_registry.cleanup_stale(kill=True)
+        if not removed:
+            print("No stale colab-mcp servers found.")
+        else:
+            print(f"Terminated {len(removed)} stale colab-mcp server(s):")
+            for e in removed:
+                print(f"  pid={e.pid} port={e.port}")
+        return
+
+    # Prune any dead entries from prior crashed runs BEFORE we bind a port.
+    # This keeps the registry honest. We don't auto-kill ALIVE entries here —
+    # multiple clients (e.g., two Claude Code instances) are valid; only the
+    # browser-tab confusion is the bug, and the per-tab token fragment scopes
+    # which server a tab talks to.
+    dead = process_registry.prune_dead()
+    if dead:
+        logging.info(f"Pruned {dead} stale entries from process registry")
+
     if args.enable_proxy:
         logging.info("enabling session proxy tools")
         _session_mcp = ColabSessionProxy()
         await _session_mcp.start_proxy_server()
         _proxy_client = _session_mcp.proxy_client
+        # Register ourselves now that we know the port.
+        try:
+            entry = process_registry.register(
+                port=_session_mcp.wss.port,
+                host=_session_mcp.wss.host,
+            )
+            logging.info(
+                f"Registered colab-mcp pid={entry.pid} port={entry.port}"
+            )
+        except Exception as exc:
+            logging.warning(f"Could not register process: {exc}")
 
     if args.client_oauth_config:
         try:
@@ -199,6 +285,11 @@ async def main_async():
     finally:
         if args.enable_proxy and _session_mcp:
             await _session_mcp.cleanup()
+        # Always unregister so a clean shutdown doesn't leave a stale entry.
+        try:
+            process_registry.unregister()
+        except Exception as exc:
+            logging.warning(f"Could not unregister process: {exc}")
 
 
 def main() -> None:
