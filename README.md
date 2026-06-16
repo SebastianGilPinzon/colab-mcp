@@ -1,16 +1,23 @@
 # Colab MCP (Enhanced Fork)
 
-An MCP server for controlling Google Colab from any AI coding agent. This fork fixes critical bugs in the [official repo](https://github.com/googlecolab/colab-mcp) and adds features that were removed upstream — including **stale-server detection / cleanup** that eliminates the "Disconnected from the local Colab MCP server" message when you have multiple Claude Code sessions or Colab tabs open ([upstream #84](https://github.com/googlecolab/colab-mcp/discussions/84)).
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
+[![MCP](https://img.shields.io/badge/protocol-MCP-purple.svg)](https://modelcontextprotocol.io)
+[![Stars](https://img.shields.io/github/stars/SebastianGilPinzon/colab-mcp?style=social)](https://github.com/SebastianGilPinzon/colab-mcp)
+
+An MCP server for controlling Google Colab from any AI coding agent. This fork fixes the bugs in the [official repo](https://github.com/googlecolab/colab-mcp) that block real day-to-day use and restores features Google removed upstream.
 
 ## Why This Fork?
 
-The official `googlecolab/colab-mcp` has two major issues:
+Three concrete dolores that the official `googlecolab/colab-mcp` doesn't solve — and that this fork does:
 
-1. **Invisible tools** ([#54](https://github.com/googlecolab/colab-mcp/discussions/54), [#67](https://github.com/googlecolab/colab-mcp/discussions/67)) — Only `open_colab_browser_connection` appears in most MCP clients. The 4 notebook tools (add_code_cell, execute_cell, etc.) are hidden until a browser connects, because the server relies on `notifications/tools/list_changed` which many clients don't support (OpenAI Codex, some Claude Code versions, Kiro IDE).
+1. **Invisible tools** ([#54](https://github.com/googlecolab/colab-mcp/discussions/54), [#67](https://github.com/googlecolab/colab-mcp/discussions/67), [#69](https://github.com/googlecolab/colab-mcp/discussions/69)) — only `open_colab_browser_connection` appears in most MCP clients (Claude Code, Codex, Kiro IDE). The notebook tools rely on `notifications/tools/list_changed`, which these clients ignore. Without `get_cells` in particular, the bridge is effectively write-only: an agent can add cells but can't read state back.
+2. **"Disconnected from the local Colab MCP server"** ([#84](https://github.com/googlecolab/colab-mcp/discussions/84)) — orphaned servers from prior Claude Code sessions hold ports that your browser tab still points at. Reconnecting from the tab silently fails.
+3. **No programmatic GPU control** — Google [removed](https://github.com/googlecolab/colab-mcp/discussions/41) the `--enable-runtime` feature entirely. You can't assign T4 / L4 / A100 without clicking in the browser.
 
-2. **No programmatic GPU control** — Google [removed](https://github.com/googlecolab/colab-mcp/discussions/41) the `--enable-runtime` feature entirely. You can't assign a GPU without manually clicking in the browser.
+This fork fixes all three. All 9 tools (1 connection + 7 notebook + 1 GPU control) appear immediately, stale servers are auto-detected and clean-uppable, and GPUs are assignable from a single tool call.
 
-This fork fixes both. All 6 tools appear immediately, and you can assign T4/L4/A100 GPUs with a single tool call.
+> _Demo coming soon: `docs/demo.gif` (TODO — short asciinema of `change_runtime` → `add_code_cell` → `run_code_cell`)._
 
 ## What's Different
 
@@ -31,8 +38,13 @@ This fork fixes both. All 6 tools appear immediately, and you can assign T4/L4/A
 | `open_colab_browser_connection` | Yes | | Connect to a Colab notebook in your browser |
 | `add_code_cell` | Yes | | Add a code cell to the notebook |
 | `add_text_cell` | Yes | | Add a markdown cell |
-| `execute_cell` | Yes | | Run a cell |
-| `update_cell` | Yes | | Edit an existing cell |
+| `get_cells` | Yes | | Read current notebook state (cells, IDs, contents, outputs) |
+| `run_code_cell` | Yes | | Execute a code cell by `cellId` |
+| `update_cell` | Yes | | Edit an existing cell by `cellId` |
+| `delete_cell` | Yes | | Delete a cell by `cellId` |
+| `move_cell` | Yes | | Move a cell to a new position by `cellId` |
+
+> **Note:** `execute_cell` was renamed to `run_code_cell` in 2026-06-16 to match the browser-side handler name. Pass a `cellId` (from `add_code_cell` or `get_cells`) — the old `cellIndex` fallback was removed.
 
 ## Quick Start (Without OAuth)
 
@@ -75,9 +87,9 @@ Add to your `.mcp.json` (Claude Code, Cursor, etc.):
 ### 4. Use it
 
 1. Restart your editor / reload window
-2. All 5 tools should appear immediately
+2. All 8 tools should appear immediately (`open_colab_browser_connection` + 7 notebook tools)
 3. Call `open_colab_browser_connection` — a Colab notebook opens in your browser
-4. Use `add_code_cell`, `execute_cell`, etc. to control the notebook
+4. Use `add_code_cell`, `run_code_cell`, `get_cells`, etc. to control the notebook
 
 ---
 
@@ -140,11 +152,16 @@ Agent: change_runtime(accelerator="T4")
 > Runtime changed to T4. Endpoint: gpu-t4-s-xxx
 
 Agent: open_colab_browser_connection()
-> Connected. Available tools: add_code_cell, execute_cell, ...
+> Connected. Available notebook tools: add_code_cell, add_text_cell, get_cells, run_code_cell, update_cell, delete_cell, move_cell
 
 Agent: add_code_cell(code="!nvidia-smi")
-Agent: execute_cell(cellIndex=0)
+> {"cellId": "abc123", ...}
+
+Agent: run_code_cell(cellId="abc123")
 > Tesla T4, 15GB memory...
+
+Agent: get_cells()
+> [{"cellId": "abc123", "code": "!nvidia-smi", "outputs": [...]}]
 ```
 
 ---
@@ -230,16 +247,27 @@ Supported platforms:
 
 This fork is based on [`googlecolab/colab-mcp`](https://github.com/googlecolab/colab-mcp) with these changes:
 
-- **`f70c00d`** Register all 5 notebook tools directly on the FastMCP server at startup (fixes invisible tools)
+- **`f70c00d`** Register notebook tools directly on the FastMCP server at startup (fixes invisible tools)
 - **`cae498b`** Add `change_runtime` tool with OAuth for programmatic GPU assignment
 - **`440e3bc`** Fix `ColabClient` initialization (missing `Prod()` env arg) + change OAuth port to 8085 for Windows
 - **`e66ee69`** Match real Colab API signatures (language param, cellId, run_code_cell)
 - **stale-server detection** Process registry + `--list-running` / `--kill-stale` flags + clearer timeout diagnostics — fixes [upstream #84](https://github.com/googlecolab/colab-mcp/discussions/84) "Disconnected from the local Colab MCP server"
+- **full 7-tool notebook surface** — pre-register `get_cells`, `delete_cell`, `move_cell` (previously missing) and rename `execute_cell` → `run_code_cell` to match the browser-side handler. Closes [upstream #69](https://github.com/googlecolab/colab-mcp/discussions/69).
 
 Google [does not accept external contributions](https://github.com/googlecolab/colab-mcp/blob/main/CONTRIBUTING.md) to the official repo, so these fixes live here.
+
+## Verified fixes (accepted in upstream discussions)
+
+- **[#67 → answered](https://github.com/googlecolab/colab-mcp/discussions/67)** — invisible-tools fix (this fork's pre-registration approach was accepted by the upstream community as the working solution).
+- **[#69](https://github.com/googlecolab/colab-mcp/discussions/69)** — follow-up on `get_cells` and the remaining missing stubs — addressed in this fork on 2026-06-16.
+- **[#84](https://github.com/googlecolab/colab-mcp/discussions/84)** — "Disconnected from the local Colab MCP server" — addressed via the stale-server registry + `--kill-stale` CLI.
 
 ---
 
 ## License
 
 Apache 2.0 (same as upstream)
+
+---
+
+⭐ **If this fork saved you time, a star helps others find it.**
