@@ -60,8 +60,11 @@ async def open_colab_browser_connection() -> str:
     if _proxy_client is None:
         return "Server not initialized. Please wait and try again."
 
+    # `?p=<port>` forces a unique URL per server instance so Chrome can't
+    # silently reuse a stale tab from a prior session (whose fragment points
+    # at a dead port). The fragment remains the source of truth for Colab.
     webbrowser.open_new(
-        f"{COLAB}{SCRATCH_PATH}#mcpProxyToken={_proxy_client.wss.token}&mcpProxyPort={_proxy_client.wss.port}"
+        f"{COLAB}{SCRATCH_PATH}?p={_proxy_client.wss.port}#mcpProxyToken={_proxy_client.wss.token}&mcpProxyPort={_proxy_client.wss.port}"
     )
 
     # Wait for browser to connect
@@ -93,11 +96,18 @@ async def open_colab_browser_connection() -> str:
             "--kill-stale` to clean up orphaned servers."
         )
     return (
-        f"Connection timed out. This server is on port {my_port}. Please "
-        "make sure you have a Colab notebook open in your browser and try "
-        "again. If a Colab tab opened but says 'Disconnected from the local "
-        "Colab MCP server', refresh that tab — the URL fragment contains the "
-        "correct token+port for this server instance."
+        f"Connection timed out. This server is on port {my_port}. Common causes:\n"
+        "  1. Stale Colab tab(s) — if Chrome reused an old tab whose URL "
+        "fragment points at a dead port, the tab will say 'Disconnected from "
+        "the local Colab MCP server'. Close every existing colab.research.google.com "
+        "tab, then retry — `?p=<port>` in the URL is used to force Chrome to "
+        "open a fresh tab per server instance.\n"
+        "  2. Local Network Access permission denied — Chrome shows a prompt "
+        "the first time Colab tries to reach localhost. Click 'Allow'. If you "
+        "previously clicked 'Block', open colab.research.google.com → site "
+        "settings → reset the 'Insecure content' / 'Other' permission and retry.\n"
+        "  3. Browser tab was never opened — make sure your default browser "
+        "is set and not blocking pop-ups for python.exe."
     )
 
 

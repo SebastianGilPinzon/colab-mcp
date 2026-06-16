@@ -208,6 +208,27 @@ Add your Google email as a test user in Cloud Console > OAuth consent screen > T
 ### Browser opens but connection times out
 Make sure you have a Colab notebook open in the browser tab that opened. Click "Connect" if prompted.
 
+### Chrome reused an old Colab tab pointing at a dead port
+
+Chrome dedupes tabs by URL canonical (ignoring the `#fragment`), so when an old Colab tab is still open with a fragment pointing at a previous server's port, calling `open_colab_browser_connection` again may silently focus the old tab instead of opening a fresh one. The old tab shows "Disconnected from the local Colab MCP server" and the new server times out.
+
+This fork mitigates that by appending the current port as a query param (`?p=<port>`) to the Colab URL, so each server instance produces a unique URL that Chrome can't dedupe. If you still hit it after upgrading:
+
+1. Close every `colab.research.google.com` tab in your browser.
+2. Retry `open_colab_browser_connection` — it will open a fresh tab pointed at the live server.
+
+### Chrome asks for "Permission to access other services and apps on this device" (or Colab says "Disconnected")
+
+When the Colab tab loads, Chrome shows a permission prompt:
+
+> **colab.research.google.com wants — Permission to access other services and apps on this device**
+
+**Click _Allow_.** If you block it, the WebSocket connection from the Colab tab to your local `colab-mcp` server is blocked, the tab shows "Disconnected from the local Colab MCP server", and `open_colab_browser_connection` will time out.
+
+This prompt is Chrome's **Local Network Access** policy: a public site (`https://colab.research.google.com`) is asking to talk to a resource on your local network (`ws://localhost:<port>` where `colab-mcp` is listening). Chrome blocks this by default and asks the user. The "other service" in the prompt is **your own `colab-mcp` server running on your machine** — not external access. The connection is scoped to a one-time token in the URL fragment (`#mcpProxyToken=...`), so even on the same machine other processes can't piggy-back on it.
+
+Chrome remembers the choice per-site, so you only need to allow it once for `colab.research.google.com`.
+
 ### "Disconnected from the local Colab MCP server" (orphaned servers)
 
 If a Colab tab in your browser shows **"Disconnected from the local Colab MCP server"** and re-clicking *Connect* doesn't help, the cause is almost always one or more **orphaned colab-mcp processes** from previous Claude Code sessions. Each instance picks a random ephemeral port, but your Colab tab only remembers the port from the URL fragment used when it first opened — when that server dies (or you spawn a new Claude Code session with a new server on a different port), the tab keeps trying to reach a dead address.

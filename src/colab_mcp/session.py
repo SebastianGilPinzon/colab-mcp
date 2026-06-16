@@ -220,8 +220,13 @@ def _make_injected_tools(
     async def check_session_proxy_tool_fn() -> bool:
         if proxy_client.is_connected():
             return True
+        # Query param `?p=<port>` forces a unique URL per server instance so
+        # Chrome opens a fresh tab instead of silently reusing a stale tab
+        # left over from a prior session (whose fragment points at a dead
+        # port). The fragment is still the source of truth for Colab's
+        # browser-side code.
         webbrowser.open_new(
-            f"{COLAB}{SCRATCH_PATH}#mcpProxyToken={proxy_client.wss.token}&mcpProxyPort={proxy_client.wss.port}"
+            f"{COLAB}{SCRATCH_PATH}?p={proxy_client.wss.port}#mcpProxyToken={proxy_client.wss.token}&mcpProxyPort={proxy_client.wss.port}"
         )
         return False
 

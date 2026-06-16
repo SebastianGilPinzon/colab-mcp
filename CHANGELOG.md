@@ -6,6 +6,33 @@ This fork follows the upstream `1.0.x` baseline and tags fork-specific work
 with the date of the change. Upstream-merged work keeps its own commit
 history.
 
+## 2026-06-16 — Stale-tab dedup fix + better timeout diagnostics
+
+Chrome dedupes browser tabs by URL canonical, ignoring the `#fragment`. That
+meant calling `open_colab_browser_connection` a second time (after the first
+server died) would silently reuse the old Colab tab whose fragment pointed at
+the dead port, instead of opening a fresh tab for the live server. The old
+tab showed "Disconnected from the local Colab MCP server" and the new server
+timed out 60s later with no actionable feedback.
+
+### Fixed
+- `open_colab_browser_connection` now appends `?p=<port>` to the Colab URL as
+  a query param. Because the port is ephemeral and changes per server
+  instance, the URL is unique → Chrome cannot dedupe → a fresh tab opens
+  every time. The `#fragment` remains the source of truth for the Colab
+  browser-side code (token + port), so this is purely a Chrome-side fix.
+
+### Changed
+- The timeout error returned by `open_colab_browser_connection` now lists the
+  three actual causes (stale tabs, Local Network Access denied, browser not
+  opening) with specific remediation, instead of a generic "make sure you
+  have a Colab notebook open" message.
+
+### Docs
+- README troubleshooting: new entries for **Chrome reused an old Colab tab**
+  and **Chrome asks for "Permission to access other services"** (Local
+  Network Access prompt), with explanations of why each is required.
+
 ## 2026-06-16 — Pre-register full 7-tool notebook surface
 
 Closes the gap reported in [discussion #69](https://github.com/googlecolab/colab-mcp/discussions/69): the post-connection success message advertised seven notebook tools, but only four were pre-registered as stubs. `get_cells`, `delete_cell`, and `move_cell` were unreachable on clients that snapshot tools at startup (Claude Code, Codex). Without `get_cells` the bridge was effectively write-only — an agent could create cells but never read state back.

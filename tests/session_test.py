@@ -251,6 +251,9 @@ class TestInjectedTools:
         args, _ = mock_webbrowser.call_args
         assert "mcpProxyToken=test-token" in args[0]
         assert "mcpProxyPort=1234" in args[0]
+        # ?p=<port> in the query forces a unique URL per server instance so
+        # Chrome opens a fresh tab instead of dedup'ing onto a stale one.
+        assert "?p=1234" in args[0]
 
     def test_has_all_expected_tools(self, mock_wss):
         proxy_client = session.ColabProxyClient(mock_wss)
