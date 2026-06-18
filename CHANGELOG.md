@@ -6,6 +6,51 @@ This fork follows the upstream `1.0.x` baseline and tags fork-specific work
 with the date of the change. Upstream-merged work keeps its own commit
 history.
 
+## 2026-06-18 — Private Network Access (PNA) handshake — the REAL real fix
+
+After the dual-stack bind fix (earlier today) the Colab tab still showed
+"Disconnected from the local Colab MCP server" with a generic 60s timeout.
+DevTools Network tab on the failing tab revealed the actual cause:
+
+- The WebSocket request stayed at "Provisional headers are shown" with
+  Connection Start → Stalled "2.3 days".
+- Server log only saw `stream ends after 0 bytes` — Chrome was opening
+  the TCP socket and then closing it before sending any HTTP bytes.
+
+This is Chrome's [Private Network Access](https://developer.chrome.com/blog/private-network-access-preflight)
+behavior. A public origin (`https://colab.research.google.com`) talking
+to a local server (`ws://localhost`) is classified as a "private network
+request" and Chrome blocks it unless the server confirms acceptance via
+specific CORS headers — both on the CORS preflight AND on the final
+WebSocket upgrade response.
+
+The upstream `googlecolab/colab-mcp` does not send these headers, which
+is why "Disconnected" hits every user who runs Chrome with default
+security settings. The earlier theories (orphaned servers, stale tabs)
+were correlated symptoms but not the cause.
+
+### Fixed
+- `_validate_authorization` (now also `process_request`) intercepts any
+  non-WebSocket request (no `Upgrade: websocket` header) and responds
+  204 No Content with:
+  - `Access-Control-Allow-Origin: https://colab.research.google.com`
+  - `Access-Control-Allow-Methods: GET, OPTIONS`
+  - `Access-Control-Allow-Headers: authorization, content-type, sec-websocket-*`
+  - `Access-Control-Allow-Private-Network: true`
+  - `Access-Control-Allow-Credentials: true`
+  - `Access-Control-Max-Age: 86400`
+- New `_augment_handshake_response` (`process_response` callback) adds
+  the same headers to the 101 Switching Protocols response. Chrome
+  re-checks PNA on the upgrade response itself — preflight alone is not
+  sufficient.
+
+### Tests added
+- `test_cors_preflight_responds_with_pna_headers` — sends a raw HTTP GET
+  (no Upgrade) and asserts the 204 response carries PNA + CORS headers.
+- `test_websocket_handshake_response_has_pna_header` — completes a real
+  WebSocket handshake and asserts the 101 response carries the PNA
+  header.
+
 ## 2026-06-18 — Root-cause fix for "Disconnected from the local Colab MCP server"
 
 The real cause of [upstream #84](https://github.com/googlecolab/colab-mcp/discussions/84) was not stale servers or stale tabs — it was an **IPv4/IPv6 dual-stack bind bug** in the WebSocket server. With `host="localhost"` + `port=0`, the `websockets` library binds two sockets on **different ephemeral ports** (one IPv6 `::1:X`, one IPv4 `127.0.0.1:Y`), then we report only one of them. When Chrome resolves `ws://localhost:<reported>` to whichever family lost the lottery, it connects to a port with **no listener**, the TCP connection drops with "stream ends after 0 bytes", and the Colab tab shows "Disconnected from the local Colab MCP server" with no retry. The user then waits 60s for a generic timeout.

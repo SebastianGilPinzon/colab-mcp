@@ -98,7 +98,46 @@ class ColabWebSocketServer:
             # server closed write stream
             pass
 
+    def _cors_preflight_headers(self) -> list[tuple[str, str]]:
+        """CORS headers required for Chrome's Private Network Access (PNA).
+
+        A public site like https://colab.research.google.com talking to a
+        local server like ws://localhost is a "private network request"
+        under Chrome's PNA spec. Chrome stalls the WebSocket upgrade until
+        the server confirms it accepts the connection by responding with
+        `Access-Control-Allow-Private-Network: true`. Without this header,
+        the upgrade is silently cancelled, the tab shows "Disconnected from
+        the local Colab MCP server", and DevTools shows the request as
+        "Provisional headers are shown" / "Stalled".
+
+        See https://developer.chrome.com/blog/private-network-access-preflight
+        """
+        return [
+            ("Access-Control-Allow-Origin", COLAB),
+            ("Access-Control-Allow-Methods", "GET, OPTIONS"),
+            (
+                "Access-Control-Allow-Headers",
+                "authorization,content-type,sec-websocket-protocol,"
+                "sec-websocket-key,sec-websocket-version,sec-websocket-extensions",
+            ),
+            ("Access-Control-Allow-Private-Network", "true"),
+            ("Access-Control-Allow-Credentials", "true"),
+            ("Access-Control-Max-Age", "86400"),
+        ]
+
     def _validate_authorization(self, websocket: ServerConnection, request: Request):
+        # CORS preflight (OPTIONS) — Chrome's Private Network Access requires
+        # the server to confirm it accepts requests from a public origin BEFORE
+        # the actual WebSocket upgrade. Non-WebSocket requests (no Upgrade
+        # header) get a 204 with the PNA headers.
+        upgrade = request.headers.get("Upgrade", "").lower()
+        if upgrade != "websocket":
+            logging.info(
+                f"CORS preflight request: path={request.path}, "
+                f"origin={request.headers.get('Origin', '<none>')}"
+            )
+            return Response(204, "No Content", Headers(self._cors_preflight_headers()))
+
         if request.path.find(f"access_token={self.token}") != -1:
             return None
         try:
@@ -114,6 +153,20 @@ class ColabWebSocketServer:
         if token == self.token:
             return None
         return Response(403, "Bad authorization token", Headers([]))
+
+    def _augment_handshake_response(
+        self, websocket: ServerConnection, request: Request, response: Response
+    ) -> Response:
+        """Add Private Network Access headers to the WebSocket upgrade response.
+
+        Even after the OPTIONS preflight succeeds, Chrome inspects the
+        actual upgrade response (101 Switching Protocols) and re-checks PNA.
+        Without these headers on the upgrade response too, the WebSocket
+        is still terminated immediately after connect.
+        """
+        for name, value in self._cors_preflight_headers():
+            response.headers[name] = value
+        return response
 
     async def _connection_handler(self, websocket: ServerConnection):
         """
@@ -158,6 +211,7 @@ class ColabWebSocketServer:
             subprotocols=[Subprotocol("mcp")],
             origins=self.allowed_origins,
             process_request=self._validate_authorization,
+            process_response=self._augment_handshake_response,
         )
 
         # Defense against the dual-stack bind bug: with host="localhost"
