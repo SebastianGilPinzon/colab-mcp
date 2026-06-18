@@ -39,7 +39,17 @@ class ColabWebSocketServer:
     from a Google Colab session (colab.google.com).
     """
 
-    def __init__(self, host="localhost"):
+    def __init__(self, host="127.0.0.1"):
+        # IMPORTANT: default is "127.0.0.1" (IPv4-only), not "localhost".
+        # With host="localhost" + port=0, the websockets library binds
+        # dual-stack — IPv4 and IPv6 each get DIFFERENT ephemeral ports.
+        # The server then reports only one of them, but Chrome resolves
+        # "localhost" preferring IPv4 on Windows, so it connects to the
+        # wrong port (no listener) — connection drops with
+        # "stream ends after 0 bytes" and the Colab tab shows
+        # "Disconnected from the local Colab MCP server".
+        # Forcing IPv4-only binds a single socket on a single port, which
+        # is what the Colab tab actually reaches via `ws://localhost:<port>`.
         self.host = host
         self.port = 0
         self.connection_lock = asyncio.Lock()
@@ -149,8 +159,32 @@ class ColabWebSocketServer:
             origins=self.allowed_origins,
             process_request=self._validate_authorization,
         )
-        self.port = self._server.sockets[0].getsockname()[1]
-        logging.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
+
+        # Defense against the dual-stack bind bug: with host="localhost"
+        # and port=0, websockets binds IPv4 and IPv6 on DIFFERENT ephemeral
+        # ports, then we report only one. The Colab tab connects via
+        # ws://localhost:<port> and Chrome may resolve to whichever address
+        # family lost the lottery — connection refused, the tab shows
+        # "Disconnected from the local Colab MCP server", and the user
+        # waits 60s for a generic timeout.
+        #
+        # We force IPv4-only (host="127.0.0.1") above, but defend against
+        # surprises here too: every socket the server bound MUST share the
+        # same port, or we refuse to start.
+        ports = {s.getsockname()[1] for s in self._server.sockets}
+        if len(ports) != 1:
+            addrs = [s.getsockname() for s in self._server.sockets]
+            raise RuntimeError(
+                f"WebSocket server bound to multiple ports ({sorted(ports)}); "
+                f"the Colab tab can only reach one of them, so any other tab "
+                f"will see 'Disconnected from the local Colab MCP server'. "
+                f"Sockets: {addrs}. Set host='127.0.0.1' to avoid dual-stack "
+                f"bind, or change websockets to bind a single port."
+            )
+        self.port = ports.pop()
+        for sock in self._server.sockets:
+            logging.info(f"WebSocket server listening on {sock.getsockname()}")
+        logging.info(f"Colab tab will connect via ws://localhost:{self.port}")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):

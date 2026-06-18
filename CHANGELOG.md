@@ -6,6 +6,30 @@ This fork follows the upstream `1.0.x` baseline and tags fork-specific work
 with the date of the change. Upstream-merged work keeps its own commit
 history.
 
+## 2026-06-18 — Root-cause fix for "Disconnected from the local Colab MCP server"
+
+The real cause of [upstream #84](https://github.com/googlecolab/colab-mcp/discussions/84) was not stale servers or stale tabs — it was an **IPv4/IPv6 dual-stack bind bug** in the WebSocket server. With `host="localhost"` + `port=0`, the `websockets` library binds two sockets on **different ephemeral ports** (one IPv6 `::1:X`, one IPv4 `127.0.0.1:Y`), then we report only one of them. When Chrome resolves `ws://localhost:<reported>` to whichever family lost the lottery, it connects to a port with **no listener**, the TCP connection drops with "stream ends after 0 bytes", and the Colab tab shows "Disconnected from the local Colab MCP server" with no retry. The user then waits 60s for a generic timeout.
+
+This was reproduced and root-caused by reading the server logs during a smoke E2E run: lines `server listening on [::1]:52319` and `server listening on 127.0.0.1:52320` for the SAME server instance.
+
+### Fixed
+- `ColabWebSocketServer.__init__` default host changed from `"localhost"` to
+  `"127.0.0.1"`, forcing IPv4-only bind. Single socket, single port, no
+  ambiguity. Chrome resolves `localhost` to `127.0.0.1` on Windows and most
+  desktop OSes, so this is transparent for the Colab tab.
+- `__aenter__` now validates that every bound socket shares the same port,
+  raising `RuntimeError` with diagnostic detail if not. This is a hard
+  guard against future regressions (e.g., someone changing `host` back to
+  `"localhost"` or to a `(v4, v6)` tuple without picking a fixed port).
+- Startup logging now lists every bound socket address (not just the first
+  one) plus the URL the Colab tab will actually use.
+
+### Tests added
+- `test_single_socket_single_port` — fails if the server binds more than one
+  port (the dual-stack regression).
+- `test_default_host_is_ipv4` — fails if the default host is set to anything
+  other than `"127.0.0.1"`.
+
 ## 2026-06-16 — Stale-tab dedup fix + better timeout diagnostics
 
 Chrome dedupes browser tabs by URL canonical, ignoring the `#fragment`. That

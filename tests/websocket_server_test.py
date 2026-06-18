@@ -203,6 +203,38 @@ async def test_malformed_auth_header():
 
 
 @pytest.mark.asyncio
+async def test_single_socket_single_port():
+    """Server must bind to exactly one socket on one port.
+
+    Defends against the dual-stack bug: with host='localhost' + port=0,
+    websockets binds IPv4 AND IPv6 on different ephemeral ports. The
+    Colab tab connects via ws://localhost:<port>, Chrome picks one
+    address family, and connects to the WRONG port (no listener) — the
+    user sees "Disconnected from the local Colab MCP server".
+    """
+    async with ColabWebSocketServer() as server:
+        sockets = list(server._server.sockets)
+        assert len(sockets) >= 1, "expected at least one bound socket"
+        ports = {s.getsockname()[1] for s in sockets}
+        assert ports == {server.port}, (
+            f"server bound to multiple ports {sorted(ports)}; the Colab "
+            f"tab would only reach one of them and the others would "
+            f"silently fail with 'Disconnected'."
+        )
+
+
+@pytest.mark.asyncio
+async def test_default_host_is_ipv4():
+    """Default host must be 127.0.0.1, not 'localhost', to avoid dual-stack."""
+    server = ColabWebSocketServer()
+    assert server.host == "127.0.0.1", (
+        f"default host is {server.host!r}; must be '127.0.0.1' to force "
+        f"IPv4-only bind. host='localhost' triggers dual-stack bind with "
+        f"different ports per family — see test_single_socket_single_port."
+    )
+
+
+@pytest.mark.asyncio
 async def test_token_in_url():
     async with ColabWebSocketServer() as server:
         client = await websockets.connect(
