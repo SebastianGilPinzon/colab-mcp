@@ -1,0 +1,16 @@
+.git
+.github
+.githooks
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+tests
+scripts
+development-methodology
+CHANGELOG.md
+.python-version
+.pre-commit-config.yaml
+.gitignore
+.dockerignore
