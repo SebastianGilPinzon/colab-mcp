@@ -36,6 +36,78 @@ _proxy_client = None
 _session_mcp = None
 _colab_client = None  # For runtime API (assign/unassign GPU)
 
+# Runtime Mode state. When change_runtime() assigns a GPU VM, it also opens a
+# direct Jupyter-kernel connection to that VM through the Colab runtime proxy.
+# Cells then execute on the GPU VM (browserless) instead of the browser tab's
+# default CPU kernel. _runtime_nbh is a *stable* notebook hash for this server
+# process so repeated change_runtime calls reuse/replace the same runtime
+# rather than orphaning a fresh VM each time (the original bug).
+_runtime_kernel = None        # jupyter_kernel_client.KernelClient | None
+_runtime_endpoint = None      # str | None — assigned VM endpoint id
+_runtime_accelerator = None   # str | None — currently-bound accelerator
+_runtime_nbh = None           # uuid.UUID — stable per-process notebook hash
+
+
+# In-memory cell buffer for Runtime Mode. The browser path tracks cells in the
+# notebook DOM; when running browserless on the GPU VM we keep our own ordered
+# list so cellIndex-based execute_cell still works.
+_runtime_cells: list[str] = []
+
+
+def _runtime_active() -> bool:
+    return _runtime_kernel is not None
+
+
+def _format_kernel_outputs(reply: dict) -> str:
+    """Render jupyter_kernel_client.execute() outputs into readable text."""
+    lines = []
+    for out in reply.get("outputs", []):
+        otype = out.get("output_type")
+        if otype == "stream":
+            lines.append(out.get("text", ""))
+        elif otype in ("execute_result", "display_data"):
+            data = out.get("data", {})
+            if "text/plain" in data:
+                lines.append(data["text/plain"])
+        elif otype == "error":
+            ename = out.get("ename", "Error")
+            evalue = out.get("evalue", "")
+            tb = "\n".join(out.get("traceback", []))
+            lines.append(f"{ename}: {evalue}\n{tb}")
+    text = "".join(lines).rstrip()
+    status = reply.get("status", "ok")
+    if status != "ok" and not text:
+        text = f"(execution status: {status})"
+    return text or "(no output)"
+
+
+async def _runtime_execute(code: str, wait: float = 8.0) -> str:
+    """Execute code on the assigned GPU VM kernel (Runtime Mode).
+
+    Long-running cells (e.g. training) keep executing on the kernel, which keeps
+    the Colab VM busy and prevents idle reclamation. We only WAIT up to ``wait``
+    seconds for the kernel to go idle; if it is still running we return a
+    non-error "still running" status so the MCP tool call returns promptly
+    instead of blocking until the harness times out and retries. The cell keeps
+    executing on the kernel — monitor it out-of-band (e.g. a heartbeat the cell
+    pushes to external storage). This is the fix for execute_cell "Request timed
+    out after N retries" on long cells.
+    """
+    try:
+        reply = await asyncio.wait_for(
+            asyncio.to_thread(_runtime_kernel.execute, code, timeout=wait),
+            timeout=wait + 5.0,
+        )
+        return _format_kernel_outputs(reply)
+    except (asyncio.TimeoutError, TimeoutError):
+        return (
+            "[cell SUBMITTED and STILL RUNNING on the kernel — returned early so "
+            "the tool call does not block. The cell keeps executing, which keeps "
+            "the Colab VM busy and alive (no idle reclamation). Do NOT assume "
+            "failure; monitor progress out-of-band (e.g. a heartbeat the cell "
+            "writes to external storage / HF).]"
+        )
+
 
 async def _forward_or_stub(tool_name: str, arguments: dict) -> str:
     """Forward a tool call to the browser if connected, otherwise return stub message."""
@@ -103,7 +175,11 @@ async def open_colab_browser_connection() -> str:
 
 @mcp.tool()
 async def add_code_cell(code: str = "", cellIndex: int = 0, language: str = "python") -> str:
-    """Add a new code cell to the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
+    """Add a new code cell to the Colab notebook. With a GPU runtime active (change_runtime), the cell is buffered for GPU execution; otherwise requires a browser connection."""
+    if _runtime_active():
+        idx = len(_runtime_cells)
+        _runtime_cells.append(code)
+        return f"Added code cell at index {idx} (runtime mode). Execute it with execute_cell(cellIndex={idx})."
     return await _forward_or_stub("add_code_cell", {"code": code, "cellIndex": cellIndex, "language": language})
 
 
@@ -115,7 +191,18 @@ async def add_text_cell(content: str = "", cellIndex: int = -1) -> str:
 
 @mcp.tool()
 async def execute_cell(cellId: str = "", cellIndex: int = 0) -> str:
-    """Execute a cell in the Colab notebook. Pass cellId (from add_code_cell result) or cellIndex. Requires an active browser connection via open_colab_browser_connection."""
+    """Execute a cell in the Colab notebook. Pass cellId (from add_code_cell result) or cellIndex. With a GPU runtime active (change_runtime) the buffered cell runs on the GPU VM; otherwise requires a browser connection."""
+    if _runtime_active():
+        try:
+            idx = int(cellId) if cellId else int(cellIndex)
+        except (TypeError, ValueError):
+            return f"Runtime mode: cellId must be a numeric index; got {cellId!r}."
+        if idx < 0 or idx >= len(_runtime_cells):
+            return (
+                f"Runtime mode: no buffered cell at index {idx} "
+                f"({len(_runtime_cells)} cell(s) added)."
+            )
+        return await _runtime_execute(_runtime_cells[idx])
     args = {}
     if cellId:
         args["cellId"] = cellId
@@ -126,13 +213,45 @@ async def execute_cell(cellId: str = "", cellIndex: int = 0) -> str:
 
 @mcp.tool()
 async def update_cell(cellId: str = "", content: str = "") -> str:
-    """Update the contents of an existing cell in the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
+    """Update the contents of an existing cell in the Colab notebook. With a GPU runtime active (change_runtime) the buffered cell is updated; otherwise requires a browser connection."""
+    if _runtime_active():
+        try:
+            idx = int(cellId)
+        except (TypeError, ValueError):
+            return f"Runtime mode: cellId must be a numeric index; got {cellId!r}."
+        if idx < 0 or idx >= len(_runtime_cells):
+            return (
+                f"Runtime mode: no buffered cell at index {idx} "
+                f"({len(_runtime_cells)} cell(s) added)."
+            )
+        _runtime_cells[idx] = content
+        return f"Updated buffered cell at index {idx} (runtime mode)."
     return await _forward_or_stub("update_cell", {"cellId": cellId, "content": content})
+
+
+def _teardown_runtime_kernel() -> None:
+    """Disconnect (and shut down) the current Runtime-Mode kernel, if any."""
+    global _runtime_kernel, _runtime_endpoint, _runtime_accelerator
+    if _runtime_kernel is not None:
+        try:
+            _runtime_kernel.stop(shutdown_kernel=True)
+        except Exception as exc:
+            logging.warning(f"Error stopping runtime kernel: {exc}")
+    _runtime_kernel = None
+    _runtime_endpoint = None
+    _runtime_accelerator = None
+    _runtime_cells.clear()
 
 
 @mcp.tool()
 async def change_runtime(accelerator: str = "T4") -> str:
-    """Change the Colab runtime to use a specific GPU accelerator. Valid values: NONE, T4, L4, A100. Requires OAuth setup (first time opens browser for consent)."""
+    """Change the Colab runtime to use a specific GPU accelerator. Valid values: NONE, T4, L4, A100.
+
+    On success this assigns the VM AND opens a direct Jupyter-kernel connection
+    to it, so cells run on the GPU (no browser needed). Requires OAuth setup
+    (first time opens browser for consent).
+    """
+    global _runtime_kernel, _runtime_endpoint, _runtime_accelerator, _runtime_nbh
     if _colab_client is None:
         return "Runtime API not initialized. Start with --client-oauth-config flag pointing to your OAuth client secrets JSON."
     try:
@@ -140,21 +259,80 @@ async def change_runtime(accelerator: str = "T4") -> str:
         import uuid
 
         acc = Accelerator(accelerator)
-        variant = Variant.GPU if acc != Accelerator.NONE else Variant.DEFAULT
-        notebook_hash = str(uuid.uuid4())
 
-        # Unassign current VM if any
-        try:
-            assignments = _colab_client.list_assignments()
-            for a in assignments:
-                _colab_client.unassign(a.endpoint)
-        except Exception:
-            pass
+        # Stable per-process notebook hash. Reusing the same hash means a repeat
+        # change_runtime replaces this runtime instead of orphaning a new VM
+        # (the original bug: a fresh uuid4() every call left the GPU unbound).
+        if _runtime_nbh is None:
+            _runtime_nbh = uuid.uuid4()
 
-        # Assign new VM
-        result = _colab_client.assign(notebook_hash, variant, acc)
-        return f"Runtime changed to {accelerator}. Endpoint: {result.endpoint}. Use open_colab_browser_connection to connect to the new runtime."
+        # Tear down any existing Runtime-Mode kernel before reassigning.
+        _teardown_runtime_kernel()
+
+        # NONE means: release the runtime and run on no GPU.
+        if acc == Accelerator.NONE:
+            try:
+                for a in _colab_client.list_assignments():
+                    _colab_client.unassign(a.endpoint)
+            except Exception as exc:
+                logging.warning(f"Error unassigning runtimes: {exc}")
+            return "Runtime set to NONE. GPU released; runtime kernel disconnected."
+
+        variant = Variant.GPU
+
+        # Assign the VM and resolve the runtime-proxy coordinates in one step.
+        conn = _colab_client.assign_runtime(_runtime_nbh, variant, acc)
+
+        if not conn.proxy_url:
+            # We have a VM but no proxy URL to drive it — surface clearly rather
+            # than silently returning a CPU-bound success like before.
+            return (
+                f"Runtime assigned (endpoint {conn.endpoint}) but the runtime "
+                "proxy URL could not be resolved, so cells cannot be routed to "
+                "the GPU. This usually means the assignment is still warming up "
+                "— retry change_runtime in a few seconds."
+            )
+
+        # Connect a Jupyter kernel to the assigned VM through the runtime proxy.
+        from jupyter_kernel_client import KernelClient
+
+        # The Colab runtime proxy (*.prod.colab.dev) does NOT authenticate with a
+        # standard `Authorization: Bearer` header — that's what made every
+        # /api/kernels request 404 at the proxy edge (empty body, no
+        # Content-Type: the edge rejected the request before reaching Jupyter).
+        # It gates on two custom headers, exactly like the official
+        # googlecolab/colab-vscode extension's `colabProxyFetch`/WebSocket:
+        #   X-Colab-Runtime-Proxy-Token: <the runtime-proxy JWT>
+        #   X-Colab-Client-Agent: vscode
+        # KernelClient threads `headers=` through to both the HTTP fetches
+        # (manager `__extra_headers`) and the kernel WebSocket handshake
+        # (wsclient `header=`), so passing them here authenticates the whole
+        # REST+WS data plane. (Verified live: GET /api/kernels -> 200 and a cell
+        # ran `torch.cuda.is_available() == True` on a Tesla T4.)
+        proxy_headers = {
+            "X-Colab-Runtime-Proxy-Token": conn.proxy_token,
+            "X-Colab-Client-Agent": "vscode",
+        }
+        kernel = KernelClient(
+            server_url=conn.proxy_url,
+            token=conn.proxy_token,
+            headers=proxy_headers,
+        )
+        # KernelClient network I/O is blocking; run it off the event loop.
+        await asyncio.to_thread(kernel.start)
+
+        _runtime_kernel = kernel
+        _runtime_endpoint = conn.endpoint
+        _runtime_accelerator = accelerator
+
+        return (
+            f"Runtime changed to {accelerator} and a kernel is connected to the "
+            f"GPU VM (endpoint {conn.endpoint}). Cells you execute now run on the "
+            "GPU directly — no browser connection required. (You can still call "
+            "open_colab_browser_connection to view the notebook in a browser.)"
+        )
     except Exception as e:
+        _teardown_runtime_kernel()
         return f"Failed to change runtime: {e}"
 
 
@@ -283,6 +461,7 @@ async def main_async():
         await mcp.run_async()
 
     finally:
+        _teardown_runtime_kernel()
         if args.enable_proxy and _session_mcp:
             await _session_mcp.cleanup()
         # Always unregister so a clean shutdown doesn't leave a stale entry.
