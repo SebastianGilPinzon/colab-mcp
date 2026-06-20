@@ -23,7 +23,7 @@ import logging
 import uuid
 
 import requests
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter
 
 # From src/colab/headers.ts
 ACCEPT_JSON_HEADER = {"key": "Accept", "value": "application/json"}
@@ -136,9 +136,7 @@ class PostAssignmentResponse(BaseModel):
 
 class Assignment(BaseModel):
     endpoint: str
-    # When a VM is already assigned, the GET /tun/m/assign response carries the
-    # endpoint but may omit the proxy token (it's recovered from list_assignments).
-    runtime_proxy_token: Optional[str] = None
+    runtime_proxy_token: str
 
 
 class GetAssignmentResponse(BaseModel):
@@ -386,14 +384,7 @@ class ColabClient:
         accelerator: Optional[Accelerator] = None,
     ) -> Union[GetAssignmentResponse, Assignment]:
         url = self._build_assign_url(notebook_hash, variant, accelerator)
-        try:
-            return self._issue_request(url, schema=GetAssignmentResponse)
-        except ValidationError:
-            # Already-assigned VMs return an Assignment-shaped body
-            # ({endpoint, [runtime_proxy_token]}) that does not match
-            # GetAssignmentResponse. Recover by reparsing as Assignment so the
-            # caller can reconnect to the live runtime instead of crashing.
-            return self._issue_request(url, schema=Assignment)
+        return self._issue_request(url, schema=GetAssignmentResponse)
 
     def _post_assignment(
         self,

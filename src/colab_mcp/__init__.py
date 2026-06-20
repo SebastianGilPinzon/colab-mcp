@@ -100,13 +100,33 @@ async def _runtime_execute(code: str, wait: float = 8.0) -> str:
         )
         return _format_kernel_outputs(reply)
     except (asyncio.TimeoutError, TimeoutError):
+        # A timeout means EITHER the cell is genuinely still running, OR the
+        # socket is dead and the reply will never come. The old code assumed the
+        # former unconditionally -> a reclaimed VM reported "still running"
+        # forever (silent failure). Disambiguate with a liveness probe.
+        try:
+            alive = await asyncio.to_thread(_runtime_kernel.is_alive)
+        except Exception:
+            alive = False
+        if alive:
+            return (
+                "[cell SUBMITTED and STILL RUNNING on the kernel — returned early so "
+                "the tool call does not block. The cell keeps executing, which keeps "
+                "the Colab VM busy and alive (no idle reclamation). Do NOT assume "
+                "failure; monitor progress out-of-band (e.g. a heartbeat the cell "
+                "writes to external storage / HF).]"
+            )
+        _mark_runtime_dead()
         return (
-            "[cell SUBMITTED and STILL RUNNING on the kernel — returned early so "
-            "the tool call does not block. The cell keeps executing, which keeps "
-            "the Colab VM busy and alive (no idle reclamation). Do NOT assume "
-            "failure; monitor progress out-of-band (e.g. a heartbeat the cell "
-            "writes to external storage / HF).]"
+            "[kernel connection LOST while the cell was running — the Colab VM was "
+            "likely reclaimed/preempted or the socket dropped. The runtime is now "
+            "marked dead; call change_runtime to reconnect and relaunch.]"
         )
+    except Exception as exc:
+        # RuntimeError('Connection was lost.'), WebSocketConnectionClosedException,
+        # etc. would otherwise propagate raw out of the tool. Report cleanly.
+        logging.warning(f"runtime execute failed: {exc}")
+        return f"[kernel execution error: {exc}. Call change_runtime to reconnect.]"
 
 
 async def _forward_or_stub(tool_name: str, arguments: dict) -> str:
@@ -243,6 +263,20 @@ def _teardown_runtime_kernel() -> None:
     _runtime_cells.clear()
 
 
+def _mark_runtime_dead() -> None:
+    """Drop the kernel reference WITHOUT shutting the kernel down.
+
+    Used when a connection drop is detected mid-cell: the VM may still be running
+    (and the cell with it), so we must NOT call stop(shutdown_kernel=True). We
+    just clear our handle so a subsequent change_runtime re-assigns/re-attaches
+    instead of refusing because a (dead-socket) kernel object still exists.
+    """
+    global _runtime_kernel, _runtime_endpoint, _runtime_accelerator
+    _runtime_kernel = None
+    _runtime_endpoint = None
+    _runtime_accelerator = None
+
+
 @mcp.tool()
 async def change_runtime(accelerator: str = "T4") -> str:
     """Change the Colab runtime to use a specific GPU accelerator. Valid values: NONE, T4, L4, A100.
@@ -265,6 +299,23 @@ async def change_runtime(accelerator: str = "T4") -> str:
         # (the original bug: a fresh uuid4() every call left the GPU unbound).
         if _runtime_nbh is None:
             _runtime_nbh = uuid.uuid4()
+
+        # Reuse-if-alive: if we're already bound to the requested accelerator and
+        # the kernel is still live, DO NOT tear it down — a re-entrant
+        # change_runtime (e.g. an agent "reconnecting" after a transient timeout)
+        # would otherwise stop(shutdown_kernel=True) and kill a running 70-min
+        # training cell. Only reassign when the accelerator changed or the kernel
+        # is actually dead.
+        if _runtime_kernel is not None and _runtime_accelerator == accelerator:
+            try:
+                if _runtime_kernel.is_alive():
+                    return (
+                        f"Runtime already on {accelerator} with a LIVE kernel "
+                        f"(endpoint {_runtime_endpoint}) — reusing it, not "
+                        "restarting. Any running cell keeps executing on the GPU VM."
+                    )
+            except Exception:
+                pass  # probe failed -> treat as dead, fall through to reassign
 
         # Tear down any existing Runtime-Mode kernel before reassigning.
         _teardown_runtime_kernel()
@@ -317,6 +368,14 @@ async def change_runtime(accelerator: str = "T4") -> str:
             server_url=conn.proxy_url,
             token=conn.proxy_token,
             headers=proxy_headers,
+            # WS keepalive + auto-reconnect. Upstream default reconnect_interval=0
+            # means a dropped data-plane socket is NEVER recovered -> the next
+            # execute raises "Connection is already closed" and the 70-min cell is
+            # lost. ping_interval keeps the socket from being idle-closed during
+            # long output-silent stretches. These forward through **kwargs to the
+            # KernelWebSocketClient (verified: ws ctor has both params).
+            ping_interval=20,
+            reconnect_interval=5,
         )
         # KernelClient network I/O is blocking; run it off the event loop.
         await asyncio.to_thread(kernel.start)

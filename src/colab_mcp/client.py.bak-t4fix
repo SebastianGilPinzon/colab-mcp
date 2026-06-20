@@ -23,7 +23,7 @@ import logging
 import uuid
 
 import requests
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter
 
 # From src/colab/headers.ts
 ACCEPT_JSON_HEADER = {"key": "Accept", "value": "application/json"}
@@ -136,9 +136,7 @@ class PostAssignmentResponse(BaseModel):
 
 class Assignment(BaseModel):
     endpoint: str
-    # When a VM is already assigned, the GET /tun/m/assign response carries the
-    # endpoint but may omit the proxy token (it's recovered from list_assignments).
-    runtime_proxy_token: Optional[str] = None
+    runtime_proxy_token: str
 
 
 class GetAssignmentResponse(BaseModel):
@@ -146,21 +144,6 @@ class GetAssignmentResponse(BaseModel):
     nbh: str = Field(..., alias="nbh")
     token: str = Field(..., alias="token")
     variant: Variant = Field(..., alias="variant")
-
-
-@dataclass
-class RuntimeConnection:
-    """Normalized coordinates for connecting a Jupyter kernel to an assigned VM.
-
-    ``proxy_url`` + ``proxy_token`` are the Jupyter-Server-compatible endpoint
-    exposed by the Colab runtime proxy for the assigned runtime. They are the
-    ``server_url`` / ``token`` a ``jupyter_kernel_client.KernelClient`` needs.
-    """
-
-    endpoint: str
-    proxy_url: Optional[str]
-    proxy_token: Optional[str]
-    is_new: bool
 
 
 XSSI_PREFIX = ")]}'\n"
@@ -314,54 +297,6 @@ class ColabClient:
 
         return res
 
-    def assign_runtime(
-        self,
-        notebook_hash: uuid.UUID,
-        variant: Optional[Variant] = None,
-        accelerator: Optional[Accelerator] = None,
-    ) -> "RuntimeConnection":
-        """Assign a runtime to ``notebook_hash`` and return everything needed to
-        connect a Jupyter kernel to the assigned VM.
-
-        Unlike :meth:`assign`, this always resolves the full runtime-proxy
-        coordinates (endpoint URL + auth token), recovering them from
-        ``list_assignments`` when the assign call returned a cached
-        :class:`Assignment` (which only carries the proxy *token*, not the URL).
-        """
-        result = self.assign(notebook_hash, variant, accelerator)
-
-        # Newly-created assignment: full proxy info is present.
-        if isinstance(result, PostAssignmentResponse):
-            return RuntimeConnection(
-                endpoint=result.endpoint,
-                proxy_url=result.runtime_proxy_info.url,
-                proxy_token=result.runtime_proxy_info.token,
-                is_new=True,
-            )
-
-        # Cached assignment path: result == {"assignment": Assignment, ...}.
-        # Assignment lacks the proxy URL, so recover it from list_assignments.
-        cached: Assignment = result["assignment"]
-        proxy_url = None
-        proxy_token = cached.runtime_proxy_token
-        try:
-            for a in self.list_assignments():
-                if a.endpoint == cached.endpoint:
-                    proxy_url = a.runtime_proxy_info.url
-                    # Prefer the freshest token from the listing.
-                    proxy_token = a.runtime_proxy_info.token or proxy_token
-                    break
-        except Exception as exc:
-            self.logger.warning(
-                "Could not recover runtime proxy URL from list_assignments: %s", exc
-            )
-        return RuntimeConnection(
-            endpoint=cached.endpoint,
-            proxy_url=proxy_url,
-            proxy_token=proxy_token,
-            is_new=False,
-        )
-
     def _build_assign_url(
         self,
         notebook_hash: uuid.UUID,
@@ -386,14 +321,7 @@ class ColabClient:
         accelerator: Optional[Accelerator] = None,
     ) -> Union[GetAssignmentResponse, Assignment]:
         url = self._build_assign_url(notebook_hash, variant, accelerator)
-        try:
-            return self._issue_request(url, schema=GetAssignmentResponse)
-        except ValidationError:
-            # Already-assigned VMs return an Assignment-shaped body
-            # ({endpoint, [runtime_proxy_token]}) that does not match
-            # GetAssignmentResponse. Recover by reparsing as Assignment so the
-            # caller can reconnect to the live runtime instead of crashing.
-            return self._issue_request(url, schema=Assignment)
+        return self._issue_request(url, schema=GetAssignmentResponse)
 
     def _post_assignment(
         self,
