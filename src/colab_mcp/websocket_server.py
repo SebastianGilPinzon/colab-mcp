@@ -53,6 +53,10 @@ class ColabWebSocketServer:
         self.host = host
         self.port = 0
         self.connection_lock = asyncio.Lock()
+        # Serialize reconnect handoffs without holding the active connection
+        # lock for the entire lifetime of the replacement attempt.
+        self._handoff_lock = asyncio.Lock()
+        self._active_websocket: ServerConnection | None = None
         self.connection_live = asyncio.Event()
         self.allowed_origins = [COLAB, COLAB_ALT_DOMAIN]
         self._server: websockets.Server | None = None
@@ -169,39 +173,50 @@ class ColabWebSocketServer:
         return response
 
     async def _connection_handler(self, websocket: ServerConnection):
-        """
-        Handles incoming websocket connections.
-        Validates Origin and ensures single-client exclusivity.
-        """
-        if self.connection_lock.locked():
-            logging.warning(
-                f"Connection rejected: {websocket.remote_address}. A client is already connected"
-            )
-            await websocket.close(code=1013, reason="Server is busy")
-            return
+        """Accept a token-authenticated reconnect without stale-session 1013s.
 
-        async with self.connection_lock:
+        The handshake (including origin and token checks) is performed before
+        this handler is called. Serialize handoffs so an older handler finishes
+        cancelling its read/write tasks before a replacement starts using the
+        shared MCP streams.
+        """
+        async with self._handoff_lock:
+            if self._active_websocket is not None:
+                logging.info("Replacing previous authenticated Colab WebSocket")
+                await self._active_websocket.close(
+                    code=1001, reason="Replaced by a new Colab connection"
+                )
+            await self.connection_lock.acquire()
+            self._active_websocket = websocket
+
+        try:
+            self.connection_live.set()
+            reading_task = asyncio.create_task(self._read_from_socket(websocket))
+            writing_task = asyncio.create_task(self._write_to_socket(websocket))
             try:
-                self.connection_live.set()
-
-                reading_task = asyncio.create_task(self._read_from_socket(websocket))
-                writing_task = asyncio.create_task(self._write_to_socket(websocket))
-                _, pending = await asyncio.wait(
-                    [reading_task, writing_task], return_when=asyncio.FIRST_COMPLETED
+                await asyncio.wait(
+                    [reading_task, writing_task],
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-
-                for task in pending:
-                    task.cancel()
-
-            except websockets.exceptions.ConnectionClosed as e:
-                logging.info(f"Connection closed: {e.code} - {e.reason}")
-                await self._read_stream_writer.send(
-                    Exception("Colab Frontend disconnected")
-                )
-            except Exception as e:
-                logging.error(f"Unexpected error: {e}")
             finally:
-                self.connection_live.clear()
+                for task in (reading_task, writing_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    reading_task, writing_task, return_exceptions=True
+                )
+        except websockets.exceptions.ConnectionClosed as exc:
+            logging.info(f"Connection closed: {exc.code} - {exc.reason}")
+            await self._read_stream_writer.send(
+                Exception("Colab Frontend disconnected")
+            )
+        except Exception as exc:
+            logging.error(f"Unexpected error: {exc}")
+        finally:
+            # Ownership is exclusive until all old socket tasks have stopped.
+            self.connection_live.clear()
+            self._active_websocket = None
+            self.connection_lock.release()
 
     async def __aenter__(self):
         self._server = await websockets.serve(

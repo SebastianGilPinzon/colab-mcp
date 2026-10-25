@@ -56,36 +56,109 @@ async def test_unauthorized_origin_rejected():
 
 
 @pytest.mark.asyncio
-async def test_second_connection_rejected():
+async def test_authenticated_reconnect_replaces_old_socket():
+    """A Colab tab reconnecting during VM assignment must not get 1013."""
     async with ColabWebSocketServer() as server:
-        client1 = await websockets.connect(
-            f"ws://localhost:{server.port}",
-            origin="https://colab.google.com",
-            subprotocols=["mcp"],
-            additional_headers={"Authorization": f"Bearer {server.token}"},
-        )
+        url = f"ws://localhost:{server.port}"
+        options = {
+            "origin": "https://colab.google.com",
+            "subprotocols": ["mcp"],
+            "additional_headers": {"Authorization": f"Bearer {server.token}"},
+        }
+        client1 = await websockets.connect(url, **options)
         assert server.connection_live.is_set()
 
-        client2 = await websockets.connect(
-            f"ws://localhost:{server.port}",
+        old_socket = server._active_websocket
+        client2 = await websockets.connect(url, **options)
+        try:
+            await asyncio.wait_for(client1.wait_closed(), timeout=2)
+            assert client1.close_code == 1001
+
+            async def replacement_ready():
+                while (
+                    server._active_websocket is None
+                    or server._active_websocket is old_socket
+                    or not server.connection_live.is_set()
+                ):
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(replacement_ready(), timeout=2)
+            assert server.connection_lock.locked()
+
+            # Verify the shared MCP writer now delivers only to the new tab.
+            request = JSONRPCRequest(
+                jsonrpc="2.0", id="reconnect", method="ping", params={}
+            )
+            await asyncio.wait_for(
+                server.write_stream.send(SessionMessage(request)), timeout=2
+            )
+            received = await asyncio.wait_for(client2.recv(), timeout=2)
+            assert JSONRPCRequest.model_validate_json(received) == request
+        finally:
+            await client2.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_reconnect_cannot_evict_authenticated_tab():
+    """Origin/token verification must happen before replacing a connection."""
+    async with ColabWebSocketServer() as server:
+        url = f"ws://localhost:{server.port}"
+        client1 = await websockets.connect(
+            url,
             origin="https://colab.google.com",
             subprotocols=["mcp"],
             additional_headers={"Authorization": f"Bearer {server.token}"},
         )
+        try:
+            with pytest.raises(websockets.exceptions.InvalidStatus):
+                await websockets.connect(
+                    url,
+                    origin="https://colab.google.com",
+                    subprotocols=["mcp"],
+                    additional_headers={"Authorization": "Bearer wrong-token"},
+                )
+            assert server.connection_live.is_set()
+            pong = await client1.ping()
+            await asyncio.wait_for(pong, timeout=2)
+        finally:
+            await client1.close()
 
-        with pytest.raises(
-            websockets.exceptions.ConnectionClosed,
-            match="Server is busy",
-            check=lambda e: e.rcvd.code == 1013,
-        ):
-            # assert we cannot ping via the second client
-            await client2.ping()
 
-        # assert we can ping via the original client
-        pong = await client1.ping()
-        pong_latency = await pong
-        assert pong_latency > 0
-        await client1.close()
+@pytest.mark.asyncio
+async def test_successive_authenticated_reconnects_keep_last_tab_alive():
+    """Rapid reconnects must not clear the newest connection's live state."""
+    async with ColabWebSocketServer() as server:
+        url = f"ws://localhost:{server.port}"
+        options = {
+            "origin": "https://colab.google.com",
+            "subprotocols": ["mcp"],
+            "additional_headers": {"Authorization": f"Bearer {server.token}"},
+        }
+        clients = []
+        try:
+            for _ in range(3):
+                old_socket = server._active_websocket
+                client = await websockets.connect(url, **options)
+                clients.append(client)
+                if len(clients) > 1:
+                    await asyncio.wait_for(clients[-2].wait_closed(), timeout=2)
+                    assert clients[-2].close_code == 1001
+
+                async def latest_ready():
+                    while (
+                        server._active_websocket is None
+                        or server._active_websocket is old_socket
+                        or not server.connection_live.is_set()
+                    ):
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(latest_ready(), timeout=2)
+
+            pong = await clients[-1].ping()
+            await asyncio.wait_for(pong, timeout=2)
+        finally:
+            for client in reversed(clients):
+                await client.close()
 
 
 @pytest.mark.asyncio
