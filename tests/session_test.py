@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 from colab_mcp import session
 from fastmcp import Client
 from fastmcp.server.middleware import MiddlewareContext
@@ -299,6 +300,60 @@ class TestColabProxyClient:
         with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.1):
             await client.await_proxy_connection()
         await client._start_task
+
+    @pytest.mark.asyncio
+    async def test_connection_timeout_keeps_background_initialization(self, mock_wss):
+        """A slow browser can connect after the initial tool wait times out."""
+        client = session.ColabProxyClient(mock_wss)
+        can_initialize = asyncio.Event()
+
+        async def initialize():
+            await can_initialize.wait()
+            client.proxy_mcp_client = Mock()
+
+        client._start_task = asyncio.create_task(initialize())
+        try:
+            with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.01):
+                await client.await_proxy_connection()
+
+            assert not client._start_task.done()
+            assert not client.is_connected()
+
+            mock_wss.connection_live.set()
+            can_initialize.set()
+            with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.5):
+                await client.await_proxy_connection()
+            assert client.is_connected()
+        finally:
+            client._start_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await client._start_task
+
+    @pytest.mark.asyncio
+    async def test_cancelled_tool_call_keeps_background_initialization(self, mock_wss):
+        """Host-level cancellation must not cancel the shared proxy startup."""
+        client = session.ColabProxyClient(mock_wss)
+        can_initialize = asyncio.Event()
+
+        async def initialize():
+            await can_initialize.wait()
+            client.proxy_mcp_client = Mock()
+
+        client._start_task = asyncio.create_task(initialize())
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(client.await_proxy_connection(), timeout=0.01)
+
+            assert not client._start_task.done()
+            mock_wss.connection_live.set()
+            can_initialize.set()
+            with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.5):
+                await client.await_proxy_connection()
+            assert client.is_connected()
+        finally:
+            client._start_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await client._start_task
 
     @pytest.mark.asyncio
     @patch("colab_mcp.session.Client")

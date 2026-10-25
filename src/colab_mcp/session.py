@@ -85,8 +85,12 @@ class ColabProxyClient:
     async def await_proxy_connection(self):
         with contextlib.suppress(asyncio.TimeoutError):
             # wait for the connection to be live and for the proxy client to fully initialize
+            # wait_for() cancels the gathered awaitables on timeout or when
+            # the MCP host cancels this tool call. Keep the long-lived proxy
+            # initialization alive so a browser that connects later still works.
             connection_tasks = asyncio.gather(
-                self.wss.connection_live.wait(), self._start_task
+                self.wss.connection_live.wait(),
+                asyncio.shield(self._start_task),
             )
             await asyncio.wait_for(
                 connection_tasks,
